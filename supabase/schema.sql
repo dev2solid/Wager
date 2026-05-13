@@ -74,6 +74,30 @@ create table if not exists public.private_bets (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.push_subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  endpoint text not null unique,
+  p256dh text not null,
+  auth text not null,
+  user_agent text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now()
+);
+
+create table if not exists public.notification_events (
+  id uuid primary key default gen_random_uuid(),
+  circle_id uuid references public.circles(id) on delete cascade,
+  actor_id uuid references auth.users(id) on delete set null,
+  event_type text not null check (event_type in ('feed_post_created', 'feed_wager_created', 'feed_post_settled', 'circle_member_joined')),
+  title text not null,
+  body text not null,
+  url text not null default '/',
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 alter table public.feed_posts
 add column if not exists image_url text;
 
@@ -474,10 +498,131 @@ begin
 end;
 $$;
 
+create or replace function public.create_wager_notification_event()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_circle public.circles%rowtype;
+  target_post public.feed_posts%rowtype;
+  actor_name text;
+  choice_label text;
+begin
+  if tg_table_name = 'feed_posts' and tg_op = 'INSERT' then
+    select * into target_circle from public.circles c where c.id = new.circle_id;
+
+    insert into public.notification_events (circle_id, actor_id, event_type, title, body, url, metadata)
+    values (
+      new.circle_id,
+      new.creator_id,
+      'feed_post_created',
+      'New bet in ' || coalesce(target_circle.name, 'Wager'),
+      new.prompt,
+      '/',
+      jsonb_build_object('post_id', new.id)
+    );
+
+    return new;
+  end if;
+
+  if tg_table_name = 'feed_wagers' and tg_op = 'INSERT' then
+    select * into target_post from public.feed_posts fp where fp.id = new.post_id;
+    select username into actor_name from public.profiles p where p.id = new.user_id;
+    choice_label := case when new.choice = 'A' then target_post.option_a else target_post.option_b end;
+
+    insert into public.notification_events (circle_id, actor_id, event_type, title, body, url, metadata)
+    values (
+      target_post.circle_id,
+      new.user_id,
+      'feed_wager_created',
+      coalesce(actor_name, 'Someone') || ' placed a bet',
+      coalesce(actor_name, 'Someone') || ' put ' || new.amount::text || ' BetCoin on ' || coalesce(choice_label, 'a side') || '.',
+      '/',
+      jsonb_build_object('post_id', new.post_id, 'wager_id', new.id, 'choice', new.choice, 'amount', new.amount)
+    );
+
+    return new;
+  end if;
+
+  if tg_table_name = 'feed_posts' and tg_op = 'UPDATE' then
+    if old.status <> 'settled' and new.status = 'settled' then
+      choice_label := case when new.winning_choice = 'A' then new.option_a else new.option_b end;
+
+      insert into public.notification_events (circle_id, actor_id, event_type, title, body, url, metadata)
+      values (
+        new.circle_id,
+        new.creator_id,
+        'feed_post_settled',
+        'Market settled',
+        new.prompt || ' settled: ' || coalesce(choice_label, 'winner picked') || ' won.',
+        '/',
+        jsonb_build_object('post_id', new.id, 'winning_choice', new.winning_choice)
+      );
+    end if;
+
+    return new;
+  end if;
+
+  return new;
+end;
+$$;
+
+create or replace function public.create_circle_join_notification_event()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_circle public.circles%rowtype;
+  actor_name text;
+begin
+  select * into target_circle from public.circles c where c.id = new.circle_id;
+  select username into actor_name from public.profiles p where p.id = new.user_id;
+
+  insert into public.notification_events (circle_id, actor_id, event_type, title, body, url, metadata)
+  values (
+    new.circle_id,
+    new.user_id,
+    'circle_member_joined',
+    coalesce(actor_name, 'Someone') || ' joined ' || coalesce(target_circle.name, 'your circle'),
+    coalesce(actor_name, 'Someone') || ' is now in the friend feed.',
+    '/',
+    jsonb_build_object('circle_id', new.circle_id)
+  );
+
+  return new;
+end;
+$$;
+
+drop trigger if exists feed_posts_notification_insert on public.feed_posts;
+create trigger feed_posts_notification_insert
+after insert on public.feed_posts
+for each row execute function public.create_wager_notification_event();
+
+drop trigger if exists feed_posts_notification_settle on public.feed_posts;
+create trigger feed_posts_notification_settle
+after update of status, winning_choice on public.feed_posts
+for each row execute function public.create_wager_notification_event();
+
+drop trigger if exists feed_wagers_notification_insert on public.feed_wagers;
+create trigger feed_wagers_notification_insert
+after insert on public.feed_wagers
+for each row execute function public.create_wager_notification_event();
+
+drop trigger if exists circle_members_notification_insert on public.circle_members;
+create trigger circle_members_notification_insert
+after insert on public.circle_members
+for each row execute function public.create_circle_join_notification_event();
+
 create index if not exists circle_members_user_id_idx on public.circle_members(user_id);
 create index if not exists feed_posts_circle_created_idx on public.feed_posts(circle_id, created_at desc);
 create index if not exists feed_wagers_post_id_idx on public.feed_wagers(post_id);
 create index if not exists private_bets_circle_created_idx on public.private_bets(circle_id, created_at desc);
+create index if not exists push_subscriptions_user_id_idx on public.push_subscriptions(user_id);
+create index if not exists notification_events_circle_created_idx on public.notification_events(circle_id, created_at desc);
 
 alter table public.profiles enable row level security;
 alter table public.circles enable row level security;
@@ -485,6 +630,8 @@ alter table public.circle_members enable row level security;
 alter table public.feed_posts enable row level security;
 alter table public.feed_wagers enable row level security;
 alter table public.private_bets enable row level security;
+alter table public.push_subscriptions enable row level security;
+alter table public.notification_events enable row level security;
 
 drop policy if exists "profiles_select_authenticated" on public.profiles;
 create policy "profiles_select_authenticated"
@@ -654,12 +801,48 @@ using (
   and (storage.foldername(name))[1] = (select auth.uid())::text
 );
 
+drop policy if exists "push_subscriptions_select_self" on public.push_subscriptions;
+create policy "push_subscriptions_select_self"
+on public.push_subscriptions for select
+to authenticated
+using (user_id = (select auth.uid()));
+
+drop policy if exists "push_subscriptions_insert_self" on public.push_subscriptions;
+create policy "push_subscriptions_insert_self"
+on public.push_subscriptions for insert
+to authenticated
+with check (user_id = (select auth.uid()));
+
+drop policy if exists "push_subscriptions_update_self" on public.push_subscriptions;
+create policy "push_subscriptions_update_self"
+on public.push_subscriptions for update
+to authenticated
+using (user_id = (select auth.uid()))
+with check (user_id = (select auth.uid()));
+
+drop policy if exists "push_subscriptions_delete_self" on public.push_subscriptions;
+create policy "push_subscriptions_delete_self"
+on public.push_subscriptions for delete
+to authenticated
+using (user_id = (select auth.uid()));
+
+drop policy if exists "notification_events_select_circle_member" on public.notification_events;
+create policy "notification_events_select_circle_member"
+on public.notification_events for select
+to authenticated
+using (
+  circle_id is not null
+  and public.is_circle_member(notification_events.circle_id)
+);
+
 revoke all on public.profiles from anon, authenticated;
 revoke all on public.circles from anon, authenticated;
 revoke all on public.circle_members from anon, authenticated;
 revoke all on public.feed_posts from anon, authenticated;
 revoke all on public.feed_wagers from anon, authenticated;
 revoke all on public.private_bets from anon, authenticated;
+revoke all on public.push_subscriptions from anon, authenticated;
+revoke all on public.notification_events from anon, authenticated;
 
 grant select on public.profiles to authenticated;
 grant update (username, avatar_color, avatar_url, updated_at) on public.profiles to authenticated;
@@ -668,12 +851,16 @@ grant select on public.circle_members to authenticated;
 grant select, insert on public.feed_posts to authenticated;
 grant select on public.feed_wagers to authenticated;
 grant select on public.private_bets to authenticated;
+grant select, insert, update, delete on public.push_subscriptions to authenticated;
+grant select on public.notification_events to authenticated;
 revoke all on function public.join_circle_by_code(text) from public, anon;
 revoke all on function public.ensure_profile(text, text, text) from public, anon;
 revoke all on function public.is_circle_member(uuid) from public, anon;
 revoke all on function public.create_circle(text, text) from public, anon;
 revoke all on function public.place_feed_wager(uuid, text, integer) from public, anon;
 revoke all on function public.settle_feed_post(uuid, text) from public, anon;
+revoke all on function public.create_wager_notification_event() from public, anon;
+revoke all on function public.create_circle_join_notification_event() from public, anon;
 grant execute on function public.join_circle_by_code(text) to authenticated;
 grant execute on function public.ensure_profile(text, text, text) to authenticated;
 grant execute on function public.is_circle_member(uuid) to authenticated;
@@ -700,6 +887,15 @@ begin
         and tablename = 'feed_wagers'
     ) then
       alter publication supabase_realtime add table public.feed_wagers;
+    end if;
+
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'notification_events'
+    ) then
+      alter publication supabase_realtime add table public.notification_events;
     end if;
   end if;
 end $$;

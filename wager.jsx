@@ -3,8 +3,11 @@ import {
   backendEnabled,
   createCircle,
   createFeedPostsForCircles,
+  disablePushNotifications,
+  enablePushNotifications,
   ensureProfile,
   getCurrentSession,
+  getNotificationSupportStatus,
   getProfile,
   listCircles,
   listFeedPosts,
@@ -16,6 +19,7 @@ import {
   signOut,
   signUpAndJoinCircle,
   subscribeToCircleFeed,
+  subscribeToNotificationEvents,
   updateProfile,
   uploadMarketImage,
   uploadProfileImage,
@@ -65,6 +69,14 @@ const CURRENT_USER = "You";
 const PENDING_INVITE_KEY = "wgr_pending_invite_code";
 const activeCircleStorageKey = (userId) => `wgr_active_circle_id:${userId || "local"}`;
 const AVATAR_COLORS = ["#19D12E", "#FBBF24", "#38BDF8", "#A78BFA", "#F472B6", "#FB7185"];
+const NOTIFICATION_LABELS = {
+  available: "Enable Notifications",
+  enabled: "Enabled",
+  blocked: "Blocked",
+  not_supported: "Not supported",
+  install_required: "Install app to enable",
+  not_configured: "Not configured",
+};
 const formatBetCoin = (amount) => `${Number(amount).toLocaleString("en-US")} ${BETCOIN}`;
 const getInitials = (value) => {
   const parts = String(value || "You").trim().split(/\s+/).filter(Boolean);
@@ -385,6 +397,8 @@ export default function Wager() {
   const [backendStatus, setBackendStatus] = useState("");
   const [authNotice, setAuthNotice] = useState("");
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [notificationStatus, setNotificationStatus] = useState(() => backendEnabled ? getNotificationSupportStatus() : "not_supported");
+  const [notificationBusy, setNotificationBusy] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(() => !load("wgr_seen_onboarding", false));
   const [onboardingStep, setOnboardingStep] = useState(0);
   const profileName = profile?.username || session?.user?.user_metadata?.username || CURRENT_USER;
@@ -531,6 +545,20 @@ export default function Wager() {
     refreshFeed();
     return subscribeToCircleFeed(activeCircleId, refreshFeed);
   }, [session, activeCircleId]);
+  useEffect(() => {
+    if (!backendEnabled) return undefined;
+    const updateStatus = () => setNotificationStatus(getNotificationSupportStatus());
+    updateStatus();
+    window.addEventListener("focus", updateStatus);
+    return () => window.removeEventListener("focus", updateStatus);
+  }, []);
+  useEffect(() => {
+    if (!backendEnabled || !session?.user) return undefined;
+    return subscribeToNotificationEvents(session.user.id, (event) => {
+      triggerCelebration(event.title || "Wager update", event.body || "New activity in your circle.");
+      if (navigator.setAppBadge) navigator.setAppBadge(1).catch(() => {});
+    });
+  }, [session?.user?.id]);
   useEffect(() => {
     const dueOwnedPosts = feedPosts.filter((post) => {
       if (post.status !== "open") return false;
@@ -805,6 +833,37 @@ export default function Wager() {
     }
   };
 
+  const handleEnableNotifications = async () => {
+    if (!session?.user || notificationBusy) return;
+    setBackendStatus("");
+    setNotificationBusy(true);
+    try {
+      await enablePushNotifications(session.user.id);
+      setNotificationStatus(getNotificationSupportStatus());
+      triggerCelebration("Notifications on", "You will hear when the circle moves.");
+    } catch (error) {
+      setNotificationStatus(getNotificationSupportStatus());
+      setBackendStatus(error.message || "Could not enable notifications.");
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+
+  const handleDisableNotifications = async () => {
+    if (!session?.user || notificationBusy) return;
+    setBackendStatus("");
+    setNotificationBusy(true);
+    try {
+      await disablePushNotifications(session.user.id);
+      setNotificationStatus(getNotificationSupportStatus());
+      triggerCelebration("Notifications off", "This device is unsubscribed.");
+    } catch (error) {
+      setBackendStatus(error.message || "Could not turn off notifications.");
+    } finally {
+      setNotificationBusy(false);
+    }
+  };
+
   const handleMarketImageChange = (event) => {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -843,6 +902,7 @@ export default function Wager() {
   const handleSignOut = async () => {
     setBackendStatus("");
     try {
+      if (session?.user?.id) await disablePushNotifications(session.user.id).catch(() => {});
       setProfileMenuOpen(false);
       await signOut();
     } catch (error) {
@@ -1950,6 +2010,37 @@ export default function Wager() {
 	                    {profileImageUploading ? "Uploading..." : "Change Photo"}
 	                    <input type="file" accept="image/*" onChange={handleProfileImageChange} disabled={profileImageUploading} style={{ display: "none" }} />
 	                  </label>
+	                  <div style={{ background: "#1B1B1B", borderRadius: 16, padding: 12, marginBottom: 10 }}>
+	                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
+	                      <div style={{ fontSize: 11, fontWeight: 900, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)" }}>NOTIFICATIONS</div>
+	                      <div style={{ fontSize: 11, fontWeight: 900, color: notificationStatus === "enabled" ? "#19D12E" : "rgba(255,255,255,0.46)" }}>
+	                        {NOTIFICATION_LABELS[notificationStatus] || "Not supported"}
+	                      </div>
+	                    </div>
+	                    {notificationStatus === "install_required" && (
+	                      <div style={{ fontSize: 12, color: "rgba(255,255,255,0.48)", lineHeight: 1.4, marginBottom: 10 }}>
+	                        On iPhone, add Wager to your Home Screen first.
+	                      </div>
+	                    )}
+	                    {notificationStatus === "not_configured" && (
+	                      <div style={{ fontSize: 12, color: "rgba(255,255,255,0.48)", lineHeight: 1.4, marginBottom: 10 }}>
+	                        Add VAPID keys in Vercel before real push can turn on.
+	                      </div>
+	                    )}
+	                    <button
+	                      className="ghost-btn"
+	                      onClick={notificationStatus === "enabled" ? handleDisableNotifications : handleEnableNotifications}
+	                      disabled={notificationBusy || notificationStatus === "blocked" || notificationStatus === "not_supported" || notificationStatus === "install_required" || notificationStatus === "not_configured"}
+	                      style={{
+	                        color: notificationStatus === "enabled" ? "#FAFAFA" : "#050505",
+	                        background: notificationStatus === "enabled" ? "#202020" : "#19D12E",
+	                        borderColor: notificationStatus === "enabled" ? "rgba(255,255,255,0.08)" : "rgba(25,209,46,0.28)",
+	                        opacity: notificationBusy || ["blocked", "not_supported", "install_required", "not_configured"].includes(notificationStatus) ? 0.58 : 1,
+	                      }}
+	                    >
+	                      {notificationBusy ? "Working..." : notificationStatus === "enabled" ? "Turn Off" : "Enable Notifications"}
+	                    </button>
+	                  </div>
 	                  <button className="ghost-btn" onClick={handleSignOut} style={{ color: "#FAFAFA" }}>
 	                    Sign Out
 	                  </button>
@@ -2403,24 +2494,29 @@ export default function Wager() {
                 style={{
                   width: "100%",
                   maxWidth: 392,
-                  background: "#111115",
-                  border: "1.5px solid rgba(255,255,255,0.08)",
-                  borderRadius: 28,
-                  padding: 20,
-                }}
-                onClick={(event) => event.stopPropagation()}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 14 }}>
-                  <div>
-                    <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 8 }}>POST A BET</div>
-                    <div style={{ fontSize: 24, fontWeight: 800, lineHeight: 1.15 }}>Create A Market Bet</div>
-                  </div>
-                  <button className="ghost-btn" onClick={() => setFeedComposerOpen(false)} style={{ width: "auto", padding: "10px 14px" }}>
-                    Close
-                  </button>
-                </div>
-                {backendEnabled && session && (
-                  <div style={{ background: "#171717", borderRadius: 18, padding: 14, marginBottom: 12 }}>
+	                  background: "#111115",
+	                  border: "1.5px solid rgba(255,255,255,0.08)",
+	                  borderRadius: 28,
+	                  padding: 0,
+	                  maxHeight: "calc(100dvh - 28px)",
+	                  overflow: "hidden",
+	                  display: "flex",
+	                  flexDirection: "column",
+	                }}
+	                onClick={(event) => event.stopPropagation()}
+	              >
+	                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "20px 20px 14px", flexShrink: 0 }}>
+	                  <div>
+	                    <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 8 }}>POST A BET</div>
+	                    <div style={{ fontSize: 24, fontWeight: 800, lineHeight: 1.15 }}>Create A Market Bet</div>
+	                  </div>
+	                  <button className="ghost-btn" onClick={() => setFeedComposerOpen(false)} style={{ width: "auto", padding: "10px 14px" }}>
+	                    Close
+	                  </button>
+	                </div>
+	                <div style={{ overflowY: "auto", WebkitOverflowScrolling: "touch", padding: "0 20px 14px", flex: 1, minHeight: 0 }}>
+	                {backendEnabled && session && (
+	                  <div style={{ background: "#171717", borderRadius: 18, padding: 14, marginBottom: 12 }}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 }}>
                       <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)" }}>POST IN</div>
                       <button
@@ -2523,16 +2619,19 @@ export default function Wager() {
                 <input
                   className="field"
                   type="datetime-local"
-                  value={feedDraft.endsAt}
-                  onChange={e => setFeedDraft((current) => ({ ...current, endsAt: e.target.value }))}
-                  style={{ marginBottom: 14 }}
-                />
-                <button className="big-btn" onClick={createFeedPost} disabled={marketImageUploading} style={{ borderRadius: 20 }}>
-                  {marketImageUploading ? "UPLOADING..." : "POST"}
-                </button>
-              </div>
-            </div>
-          )}
+	                  value={feedDraft.endsAt}
+	                  onChange={e => setFeedDraft((current) => ({ ...current, endsAt: e.target.value }))}
+	                  style={{ marginBottom: 0 }}
+	                />
+	                </div>
+	                <div style={{ padding: "12px 20px 20px", borderTop: "1px solid rgba(255,255,255,0.07)", background: "#111115", flexShrink: 0 }}>
+	                  <button className="big-btn" onClick={createFeedPost} disabled={marketImageUploading} style={{ borderRadius: 20 }}>
+	                    {marketImageUploading ? "UPLOADING..." : "POST"}
+	                  </button>
+	                </div>
+	              </div>
+	            </div>
+	          )}
         </div>
       )}
 

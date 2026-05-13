@@ -5,6 +5,7 @@ const BETCOIN = "BetCoin";
 const genInviteName = () => `Circle ${new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
 const DEFAULT_AVATAR_COLOR = "#19D12E";
 const IMAGE_BUCKET = "wager-images";
+const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || "";
 
 export const backendEnabled = isSupabaseConfigured;
 
@@ -89,6 +90,74 @@ export async function updateProfile(userId, changes) {
     .single();
   if (error) throw error;
   return data;
+}
+
+function urlBase64ToUint8Array(value) {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(base64);
+  return Uint8Array.from([...raw].map((char) => char.charCodeAt(0)));
+}
+
+export function getNotificationSupportStatus() {
+  if (typeof window === "undefined") return "not_supported";
+  const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isStandalone = window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone === true;
+  if (isIos && !isStandalone) return "install_required";
+  if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) return "not_supported";
+  if (Notification.permission === "denied") return "blocked";
+  if (!VAPID_PUBLIC_KEY) return "not_configured";
+  if (Notification.permission === "granted") return "enabled";
+  return "available";
+}
+
+export async function enablePushNotifications(userId) {
+  if (!supabase || !userId) throw new Error("Sign in before enabling notifications.");
+  if (!VAPID_PUBLIC_KEY) throw new Error("VAPID public key is missing.");
+  const supportStatus = getNotificationSupportStatus();
+  if (supportStatus === "install_required") throw new Error("Install Wager to your Home Screen to enable notifications on iPhone.");
+  if (supportStatus === "not_supported") throw new Error("Push notifications are not supported in this browser.");
+  if (supportStatus === "not_configured") throw new Error("Notification keys are not configured yet.");
+  if (supportStatus === "blocked") throw new Error("Notifications are blocked. Turn them back on in your browser settings.");
+
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    if (permission === "denied") throw new Error("Notifications are blocked. Turn them back on in your browser settings.");
+    throw new Error("Notification permission was not granted.");
+  }
+
+  const registration = await navigator.serviceWorker.ready;
+  const existing = await registration.pushManager.getSubscription();
+  const subscription = existing || await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+  });
+  const json = subscription.toJSON();
+
+  const { error } = await supabase.from("push_subscriptions").upsert({
+    user_id: userId,
+    endpoint: subscription.endpoint,
+    p256dh: json.keys?.p256dh,
+    auth: json.keys?.auth,
+    user_agent: navigator.userAgent,
+    updated_at: new Date().toISOString(),
+    last_seen_at: new Date().toISOString(),
+  }, { onConflict: "endpoint" });
+  if (error) throw error;
+  return subscription;
+}
+
+export async function disablePushNotifications(userId) {
+  if (!supabase || !userId || !("serviceWorker" in navigator)) return;
+  const registration = await navigator.serviceWorker.ready.catch(() => null);
+  const subscription = await registration?.pushManager?.getSubscription();
+  if (!subscription) return;
+  await supabase
+    .from("push_subscriptions")
+    .delete()
+    .eq("user_id", userId)
+    .eq("endpoint", subscription.endpoint);
+  await subscription.unsubscribe().catch(() => {});
 }
 
 function getFileExtension(file) {
@@ -253,6 +322,25 @@ export function subscribeToCircleFeed(circleId, onChange) {
       "postgres_changes",
       { event: "*", schema: "public", table: "feed_wagers" },
       onChange
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}
+
+export function subscribeToNotificationEvents(userId, onEvent) {
+  if (!supabase || !userId) return () => {};
+  const channel = supabase
+    .channel(`wager-notifications:${userId}`)
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "notification_events" },
+      (payload) => {
+        if (payload.new?.actor_id === userId) return;
+        onEvent(payload.new);
+      }
     )
     .subscribe();
 
