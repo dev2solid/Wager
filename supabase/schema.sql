@@ -7,6 +7,7 @@ create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   username text not null default 'You',
   avatar_color text not null default '#19D12E',
+  avatar_url text,
   balance integer not null default 1000 check (balance >= 0),
   win_streak integer not null default 0 check (win_streak >= 0),
   created_at timestamptz not null default now(),
@@ -15,6 +16,9 @@ create table if not exists public.profiles (
 
 alter table public.profiles
 add column if not exists avatar_color text not null default '#19D12E';
+
+alter table public.profiles
+add column if not exists avatar_url text;
 
 create table if not exists public.circles (
   id uuid primary key default gen_random_uuid(),
@@ -40,6 +44,7 @@ create table if not exists public.feed_posts (
   category text not null default 'Community Bet',
   option_a text not null default 'Option A',
   option_b text not null default 'Option B',
+  image_url text,
   ends_at timestamptz,
   status text not null default 'open' check (status in ('open', 'settled')),
   winning_choice text check (winning_choice in ('A', 'B')),
@@ -69,6 +74,13 @@ create table if not exists public.private_bets (
   created_at timestamptz not null default now()
 );
 
+alter table public.feed_posts
+add column if not exists image_url text;
+
+insert into storage.buckets (id, name, public)
+values ('wager-images', 'wager-images', true)
+on conflict (id) do update set public = true;
+
 do $$
 begin
   if not exists (
@@ -94,11 +106,14 @@ begin
   end if;
 end $$;
 
-create or replace function public.ensure_profile(username_input text default null, avatar_color_input text default null)
+drop function if exists public.ensure_profile(text, text);
+
+create or replace function public.ensure_profile(username_input text default null, avatar_color_input text default null, avatar_url_input text default null)
 returns table (
   id uuid,
   username text,
   avatar_color text,
+  avatar_url text,
   balance integer,
   win_streak integer,
   created_at timestamptz,
@@ -120,12 +135,13 @@ begin
   display_name := coalesce(nullif(trim(username_input), ''), split_part(auth.jwt() ->> 'email', '@', 1), 'You');
   safe_avatar_color := coalesce(nullif(trim(avatar_color_input), ''), '#19D12E');
 
-  insert into public.profiles (id, username, avatar_color)
-  values (auth.uid(), display_name, safe_avatar_color)
+  insert into public.profiles (id, username, avatar_color, avatar_url)
+  values (auth.uid(), display_name, safe_avatar_color, nullif(trim(avatar_url_input), ''))
   on conflict on constraint profiles_pkey do update
   set
     username = excluded.username,
     avatar_color = excluded.avatar_color,
+    avatar_url = coalesce(excluded.avatar_url, public.profiles.avatar_url),
     updated_at = now()
   returning * into profile_row;
 
@@ -134,6 +150,7 @@ begin
     profile_row.id,
     profile_row.username,
     profile_row.avatar_color,
+    profile_row.avatar_url,
     profile_row.balance,
     profile_row.win_streak,
     profile_row.created_at,
@@ -600,6 +617,43 @@ with check (
   or opponent_id = (select auth.uid())
 );
 
+drop policy if exists "wager_images_select_public" on storage.objects;
+create policy "wager_images_select_public"
+on storage.objects for select
+to public
+using (bucket_id = 'wager-images');
+
+drop policy if exists "wager_images_insert_own_folder" on storage.objects;
+create policy "wager_images_insert_own_folder"
+on storage.objects for insert
+to authenticated
+with check (
+  bucket_id = 'wager-images'
+  and (storage.foldername(name))[1] = (select auth.uid())::text
+);
+
+drop policy if exists "wager_images_update_own_folder" on storage.objects;
+create policy "wager_images_update_own_folder"
+on storage.objects for update
+to authenticated
+using (
+  bucket_id = 'wager-images'
+  and (storage.foldername(name))[1] = (select auth.uid())::text
+)
+with check (
+  bucket_id = 'wager-images'
+  and (storage.foldername(name))[1] = (select auth.uid())::text
+);
+
+drop policy if exists "wager_images_delete_own_folder" on storage.objects;
+create policy "wager_images_delete_own_folder"
+on storage.objects for delete
+to authenticated
+using (
+  bucket_id = 'wager-images'
+  and (storage.foldername(name))[1] = (select auth.uid())::text
+);
+
 revoke all on public.profiles from anon, authenticated;
 revoke all on public.circles from anon, authenticated;
 revoke all on public.circle_members from anon, authenticated;
@@ -608,20 +662,20 @@ revoke all on public.feed_wagers from anon, authenticated;
 revoke all on public.private_bets from anon, authenticated;
 
 grant select on public.profiles to authenticated;
-grant update (username, avatar_color, updated_at) on public.profiles to authenticated;
+grant update (username, avatar_color, avatar_url, updated_at) on public.profiles to authenticated;
 grant select on public.circles to authenticated;
 grant select on public.circle_members to authenticated;
 grant select, insert on public.feed_posts to authenticated;
 grant select on public.feed_wagers to authenticated;
 grant select on public.private_bets to authenticated;
 revoke all on function public.join_circle_by_code(text) from public, anon;
-revoke all on function public.ensure_profile(text, text) from public, anon;
+revoke all on function public.ensure_profile(text, text, text) from public, anon;
 revoke all on function public.is_circle_member(uuid) from public, anon;
 revoke all on function public.create_circle(text, text) from public, anon;
 revoke all on function public.place_feed_wager(uuid, text, integer) from public, anon;
 revoke all on function public.settle_feed_post(uuid, text) from public, anon;
 grant execute on function public.join_circle_by_code(text) to authenticated;
-grant execute on function public.ensure_profile(text, text) to authenticated;
+grant execute on function public.ensure_profile(text, text, text) to authenticated;
 grant execute on function public.is_circle_member(uuid) to authenticated;
 grant execute on function public.create_circle(text, text) to authenticated;
 grant execute on function public.place_feed_wager(uuid, text, integer) to authenticated;

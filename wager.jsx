@@ -1,8 +1,8 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   backendEnabled,
   createCircle,
-  createFeedPost as createFeedPostRemote,
+  createFeedPostsForCircles,
   ensureProfile,
   getCurrentSession,
   getProfile,
@@ -16,6 +16,9 @@ import {
   signOut,
   signUpAndJoinCircle,
   subscribeToCircleFeed,
+  updateProfile,
+  uploadMarketImage,
+  uploadProfileImage,
 } from "./wagerBackend.js";
 
 const load = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
@@ -28,6 +31,7 @@ const BETCOIN_COIN_VIDEO_WEBM = "/assets/betcoin-flip.webm";
 const BETCOIN_COIN_VIDEO = "/assets/betcoin-flip.mp4";
 const QUICK_WAGERS = ["Friendly Bet", "Dinner", "Drinks", "Car wash", "Coffee", "Custom..."];
 const QUICK_BETCOIN = [50, 100, 250, 500, 1000];
+const freshPrivateBetDraft = () => ({ what: "", wagerType: "betcoin", wager: "", custom: "", betCoinAmount: "100" });
 const FEED_TEMPLATES = [
   { id: "over_under", label: "Over / Under", optionA: "Over", optionB: "Under" },
   { id: "yes_no", label: "Yes / No", optionA: "Yes", optionB: "No" },
@@ -59,6 +63,7 @@ const REUP_AMOUNT = 250;
 const REUP_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const CURRENT_USER = "You";
 const PENDING_INVITE_KEY = "wgr_pending_invite_code";
+const activeCircleStorageKey = (userId) => `wgr_active_circle_id:${userId || "local"}`;
 const AVATAR_COLORS = ["#19D12E", "#FBBF24", "#38BDF8", "#A78BFA", "#F472B6", "#FB7185"];
 const formatBetCoin = (amount) => `${Number(amount).toLocaleString("en-US")} ${BETCOIN}`;
 const getInitials = (value) => {
@@ -155,6 +160,7 @@ const normalizeFeedPost = (post) => {
     creator: typeof post.creator === "string" && post.creator.trim() ? post.creator.trim() : CURRENT_USER,
     prompt: typeof post.prompt === "string" ? post.prompt : "",
     category: typeof post.category === "string" ? post.category : "Community Bet",
+    imageUrl: typeof post.imageUrl === "string" && post.imageUrl ? post.imageUrl : null,
     optionA: typeof post.optionA === "string" && post.optionA.trim() ? post.optionA.trim() : "Option A",
     optionB: typeof post.optionB === "string" && post.optionB.trim() ? post.optionB.trim() : "Option B",
     createdAt: typeof post.createdAt === "string" ? post.createdAt : now(),
@@ -257,7 +263,28 @@ function CoinFace({ size = 44 }) {
   );
 }
 
-function ProfileAvatar({ name, color, size = 42 }) {
+function ProfileAvatar({ name, color, size = 42, src = null }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => setImageFailed(false), [src]);
+
+  if (src && !imageFailed) {
+    return (
+      <img
+        src={src}
+        alt={name || "Profile"}
+        onError={() => setImageFailed(true)}
+        style={{
+          width: size,
+          height: size,
+          borderRadius: "50%",
+          objectFit: "cover",
+          flexShrink: 0,
+          boxShadow: "0 10px 24px rgba(0,0,0,0.24)",
+        }}
+      />
+    );
+  }
+
   return (
     <div
       style={{
@@ -280,20 +307,43 @@ function ProfileAvatar({ name, color, size = 42 }) {
   );
 }
 
+function MarketImage({ src }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [src]);
+  if (!src || failed) return null;
+  return (
+    <img
+      src={src}
+      alt=""
+      onError={() => setFailed(true)}
+      style={{
+        width: "100%",
+        aspectRatio: "16 / 10",
+        objectFit: "cover",
+        borderRadius: 22,
+        marginBottom: 12,
+        background: "#1B1B1B",
+      }}
+    />
+  );
+}
+
 export default function Wager() {
+  const sessionUserIdRef = useRef(null);
   const [bets, setBets] = useState(loadBets);
   const [feedPosts, setFeedPosts] = useState(loadFeedPosts);
   const [screen, setScreen] = useState("feed"); // feed | bet | history | home | detail
   const [activeBet, setActiveBet] = useState(null);
   const [detailOrigin, setDetailOrigin] = useState("home");
   const [step, setStep] = useState(1); // 1=what, 2=wager, 3=confirm
-  const [draft, setDraft] = useState({ what: "", wagerType: "betcoin", wager: "", custom: "", betCoinAmount: "100" });
+  const [draft, setDraft] = useState(freshPrivateBetDraft);
   const [feedDraft, setFeedDraft] = useState({
     creator: CURRENT_USER,
     prompt: "",
     category: "Over / Under",
     optionA: "Over",
     optionB: "Under",
+    imageUrl: "",
     endsAt: "",
     pricingMode: "no_house",
     oddsA: "1.90",
@@ -320,10 +370,18 @@ export default function Wager() {
   const [profile, setProfile] = useState(null);
   const [circles, setCircles] = useState([]);
   const [activeCircleId, setActiveCircleId] = useState(null);
+  const [circleAddOpen, setCircleAddOpen] = useState(false);
+  const [circleAddMode, setCircleAddMode] = useState("join");
   const [authMode, setAuthMode] = useState("join");
   const [authForm, setAuthForm] = useState({ email: "", password: "", username: "", inviteCode: "" });
   const [joinCode, setJoinCode] = useState("");
   const [newCircleName, setNewCircleName] = useState("");
+  const [composerCircleIds, setComposerCircleIds] = useState([]);
+  const [postInAllCircles, setPostInAllCircles] = useState(false);
+  const [marketImagePreview, setMarketImagePreview] = useState("");
+  const [marketImageFile, setMarketImageFile] = useState(null);
+  const [profileImageUploading, setProfileImageUploading] = useState(false);
+  const [marketImageUploading, setMarketImageUploading] = useState(false);
   const [backendStatus, setBackendStatus] = useState("");
   const [authNotice, setAuthNotice] = useState("");
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -331,6 +389,7 @@ export default function Wager() {
   const [onboardingStep, setOnboardingStep] = useState(0);
   const profileName = profile?.username || session?.user?.user_metadata?.username || CURRENT_USER;
   const profileColor = profile?.avatar_color || session?.user?.user_metadata?.avatar_color || getAvatarColor(profileName);
+  const profileAvatarUrl = profile?.avatar_url || session?.user?.user_metadata?.avatar_url || null;
   const activeCircle = circles.find((circle) => circle.id === activeCircleId) || null;
 
   useEffect(() => { save("wgr_bets", bets); }, [bets]);
@@ -350,6 +409,7 @@ export default function Wager() {
       try {
         const currentSession = await getCurrentSession();
         if (cancelled) return;
+        sessionUserIdRef.current = currentSession?.user?.id || null;
         setSession(currentSession);
         if (currentSession?.user) {
           const nextProfile = await ensureProfile(currentSession.user);
@@ -366,12 +426,24 @@ export default function Wager() {
 
     boot();
     const unsubscribe = onAuthChanged(async (nextSession) => {
+      const currentUserId = sessionUserIdRef.current;
+      const nextUserId = nextSession?.user?.id || null;
+      const userChanged = currentUserId !== nextUserId;
+      sessionUserIdRef.current = nextUserId;
       setSession(nextSession);
-      setProfile(null);
-      setCircles([]);
-      setActiveCircleId(null);
-      setFeedPosts([]);
-      if (!nextSession?.user) return;
+      if (!nextSession?.user) {
+        setProfile(null);
+        setCircles([]);
+        setActiveCircleId(null);
+        setFeedPosts([]);
+        return;
+      }
+      if (userChanged) {
+        setProfile(null);
+        setCircles([]);
+        setActiveCircleId(null);
+        setFeedPosts([]);
+      }
       try {
         const nextProfile = await ensureProfile(nextSession.user);
         setProfile(nextProfile);
@@ -404,7 +476,12 @@ export default function Wager() {
         const rows = await listCircles();
         if (cancelled) return;
         setCircles(rows);
-        setActiveCircleId((current) => current || rows[0]?.id || null);
+        setActiveCircleId((current) => {
+          const saved = load(activeCircleStorageKey(session.user.id), null);
+          if (current && rows.some((circle) => circle.id === current)) return current;
+          if (saved && rows.some((circle) => circle.id === saved)) return saved;
+          return rows[0]?.id || null;
+        });
       } catch (error) {
         setBackendStatus(error.message || "Could not load your friend feed.");
       }
@@ -415,6 +492,20 @@ export default function Wager() {
       cancelled = true;
     };
   }, [session]);
+  useEffect(() => {
+    if (!session?.user?.id || !activeCircleId) return;
+    save(activeCircleStorageKey(session.user.id), activeCircleId);
+  }, [session?.user?.id, activeCircleId]);
+  useEffect(() => {
+    if (!feedComposerOpen) return;
+    const validIds = circles.map((circle) => circle.id);
+    setComposerCircleIds((current) => {
+      const filtered = current.filter((id) => validIds.includes(id));
+      if (filtered.length > 0) return filtered;
+      return activeCircleId && validIds.includes(activeCircleId) ? [activeCircleId] : validIds.slice(0, 1);
+    });
+    setPostInAllCircles(false);
+  }, [feedComposerOpen, activeCircleId, circles]);
   useEffect(() => {
     if (!backendEnabled || !session?.user || !activeCircleId) return undefined;
     let cancelled = false;
@@ -452,6 +543,9 @@ export default function Wager() {
     triggerCelebration("Result needed", "Pick the winner so BetCoin can settle.");
     setFeedRemindersSeen((current) => [...current, nextReminder.id]);
   }, [feedPosts, nowMs, feedRemindersSeen]);
+  useEffect(() => () => {
+    if (marketImagePreview) URL.revokeObjectURL(marketImagePreview);
+  }, [marketImagePreview]);
 
   const directReservedBalance = bets.reduce((total, bet) => {
     if (bet.status !== "open" && bet.status !== "locked") return total;
@@ -581,7 +675,7 @@ export default function Wager() {
   };
 
   const startNew = () => {
-    setDraft({ what: "", wagerType: "betcoin", wager: "", custom: "", betCoinAmount: "100" });
+    setDraft(freshPrivateBetDraft());
     setStep(1);
     setReviewTicketOpen(false);
     setScreen("bet");
@@ -589,6 +683,7 @@ export default function Wager() {
 
   const switchTab = (target) => {
     if (target === "bet") {
+      setDraft(freshPrivateBetDraft());
       setStep(1);
       setLocked(false);
     }
@@ -669,6 +764,7 @@ export default function Wager() {
       setCircles((current) => [...current, circle]);
       setActiveCircleId(circle.id);
       setNewCircleName("");
+      setCircleAddOpen(false);
       triggerCelebration("Circle created", `${circle.name} is ready for friends.`);
     } catch (error) {
       setBackendStatus(error.message || "Could not create a friend feed.");
@@ -684,10 +780,47 @@ export default function Wager() {
       setCircles((current) => current.some((item) => item.id === circle.id) ? current : [...current, circle]);
       setActiveCircleId(circle.id);
       setJoinCode("");
+      setCircleAddOpen(false);
       triggerCelebration("Circle joined", "You are in the friends feed.");
     } catch (error) {
       setBackendStatus(error.message || "Could not join that friend circle.");
     }
+  };
+
+  const handleProfileImageChange = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !session?.user) return;
+    setBackendStatus("");
+    setProfileImageUploading(true);
+    try {
+      const avatarUrl = await uploadProfileImage(file, session.user.id);
+      const nextProfile = await updateProfile(session.user.id, { avatar_url: avatarUrl });
+      setProfile(nextProfile);
+      triggerCelebration("Profile updated", "Your photo is live.");
+    } catch (error) {
+      setBackendStatus(error.message || "Could not upload that profile photo.");
+    } finally {
+      setProfileImageUploading(false);
+    }
+  };
+
+  const handleMarketImageChange = (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (marketImagePreview) URL.revokeObjectURL(marketImagePreview);
+    setMarketImageFile(file);
+    setMarketImagePreview(URL.createObjectURL(file));
+  };
+
+  const toggleComposerCircle = (circleId) => {
+    setPostInAllCircles(false);
+    setComposerCircleIds((current) => (
+      current.includes(circleId)
+        ? current.filter((id) => id !== circleId)
+        : [...current, circleId]
+    ));
   };
 
   const shareAccessCode = async () => {
@@ -735,25 +868,39 @@ export default function Wager() {
   const createFeedPost = async () => {
     if (!feedDraft.prompt.trim() || !feedDraft.optionA.trim() || !feedDraft.optionB.trim()) return;
     if (backendEnabled) {
-      if (!session?.user || !activeCircleId) return;
+      if (!session?.user) return;
+      const targetCircleIds = postInAllCircles ? circles.map((circle) => circle.id) : composerCircleIds;
+      if (targetCircleIds.length === 0) {
+        setBackendStatus("Choose at least one circle to post in.");
+        return;
+      }
       setBackendStatus("");
+      setMarketImageUploading(Boolean(marketImageFile));
       try {
-        await createFeedPostRemote(activeCircleId, session.user.id, feedDraft);
+        const imageUrl = marketImageFile ? await uploadMarketImage(marketImageFile, session.user.id) : feedDraft.imageUrl;
+        await createFeedPostsForCircles(targetCircleIds, session.user.id, { ...feedDraft, imageUrl });
         setFeedDraft({
           creator: profile?.username || CURRENT_USER,
           prompt: "",
           category: "Over / Under",
           optionA: "Over",
           optionB: "Under",
+          imageUrl: "",
           endsAt: "",
           pricingMode: "no_house",
           oddsA: "1.90",
           oddsB: "1.90",
         });
+        setMarketImageFile(null);
+        setMarketImagePreview("");
+        setComposerCircleIds(activeCircleId ? [activeCircleId] : []);
+        setPostInAllCircles(false);
         setFeedComposerOpen(false);
-        triggerCelebration("Post live", "Your friends can bet it now.");
+        triggerCelebration("Post live", targetCircleIds.length === 1 ? "Your friends can bet it now." : `Posted to ${targetCircleIds.length} circles.`);
       } catch (error) {
         setBackendStatus(error.message || "Could not post this bet.");
+      } finally {
+        setMarketImageUploading(false);
       }
       return;
     }
@@ -764,6 +911,7 @@ export default function Wager() {
       category: feedDraft.category.trim() || "Community Bet",
       optionA: feedDraft.optionA.trim(),
       optionB: feedDraft.optionB.trim(),
+      imageUrl: feedDraft.imageUrl || marketImagePreview || null,
       createdAt: now(),
       endsAt: feedDraft.endsAt || null,
       pricingMode: feedDraft.pricingMode === "odds" ? "odds" : "no_house",
@@ -916,11 +1064,15 @@ export default function Wager() {
       p2_bet: false,
     };
     setBets(p => [bet, ...p]);
-    setActiveBet(bet);
-    setDetailOrigin("bet");
     setLocked(true);
     setReviewTicketOpen(false);
-    setTimeout(() => { setLocked(false); setScreen("detail"); }, 1200);
+    triggerCelebration("Bet created", "Nice. It is saved in your history.", "win");
+    setTimeout(() => {
+      setLocked(false);
+      setDraft(freshPrivateBetDraft());
+      setStep(1);
+      setScreen("history");
+    }, 900);
   };
 
   const buildShareMessage = ({ what, wager }) => (
@@ -1730,10 +1882,11 @@ export default function Wager() {
                   width: 44,
                   height: 44,
                   borderRadius: "50%",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  background: "#1A1A1A",
-                  color: "#FAFAFA",
+                  border: "1px solid rgba(25,209,46,0.28)",
+                  background: "#19D12E",
+                  color: "#050505",
                   fontSize: 28,
+                  fontWeight: 900,
                   lineHeight: 1,
                   cursor: "pointer",
                   flexShrink: 0,
@@ -1758,7 +1911,7 @@ export default function Wager() {
 	                    maxWidth: 166,
 	                  }}
 	                >
-	                  <ProfileAvatar name={profileName} color={profileColor} size={32} />
+	                  <ProfileAvatar name={profileName} color={profileColor} src={profileAvatarUrl} size={32} />
 	                  <div style={{ textAlign: "left", minWidth: 0 }}>
 	                    <div style={{ fontSize: 12, fontWeight: 800, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{profileName}</div>
 	                    <div style={{ fontSize: 10, fontWeight: 800, color: "#19D12E" }}>{availableBalance.toLocaleString("en-US")} BC</div>
@@ -1783,7 +1936,7 @@ export default function Wager() {
 	                  }}
 	                >
 	                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
-	                    <ProfileAvatar name={profileName} color={profileColor} size={48} />
+	                    <ProfileAvatar name={profileName} color={profileColor} src={profileAvatarUrl} size={48} />
 	                    <div style={{ minWidth: 0 }}>
 	                      <div style={{ fontSize: 16, fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{profileName}</div>
 	                      <div style={{ fontSize: 12, color: "rgba(255,255,255,0.42)", marginTop: 4 }}>Streak x{winStreak}</div>
@@ -1793,6 +1946,10 @@ export default function Wager() {
 	                    <div style={{ fontSize: 11, fontWeight: 900, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 6 }}>BETCOIN</div>
 	                    <div style={{ fontSize: 20, fontWeight: 900, color: "#19D12E" }}>{formatBetCoin(availableBalance)}</div>
 	                  </div>
+	                  <label className="ghost-btn" style={{ color: "#FAFAFA", display: "block", textAlign: "center", marginBottom: 10, cursor: profileImageUploading ? "wait" : "pointer" }}>
+	                    {profileImageUploading ? "Uploading..." : "Change Photo"}
+	                    <input type="file" accept="image/*" onChange={handleProfileImageChange} disabled={profileImageUploading} style={{ display: "none" }} />
+	                  </label>
 	                  <button className="ghost-btn" onClick={handleSignOut} style={{ color: "#FAFAFA" }}>
 	                    Sign Out
 	                  </button>
@@ -1821,19 +1978,70 @@ export default function Wager() {
 		                  <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 6 }}>FRIEND CIRCLE</div>
 			                  <div style={{ fontSize: 18, fontWeight: 800 }}>{activeCircle?.name || (circles.length ? "Choose a circle" : "Enter a friend code or create your own circle.")}</div>
 		                </div>
-		              </div>
-		              <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-		                <input
-		                  className="field"
-		                  placeholder="Name your circle"
-		                  value={newCircleName}
-		                  onChange={e => setNewCircleName(e.target.value)}
-		                  style={{ flex: 1, padding: "12px 14px", borderRadius: 16, fontSize: 13 }}
-		                />
-		                <button className="ghost-btn" onClick={handleCreateCircle} style={{ width: "auto", padding: "10px 14px", color: "#FAFAFA" }}>
-		                  Create
+		                <button
+		                  className="ghost-btn"
+		                  onClick={() => setCircleAddOpen((open) => !open)}
+		                  style={{ width: "auto", padding: "10px 14px", color: "#050505", background: "#19D12E", borderColor: "rgba(25,209,46,0.28)" }}
+		                >
+		                  + Add
 		                </button>
 		              </div>
+		              {circleAddOpen && (
+		                <div style={{ background: "#1B1B1B", borderRadius: 20, padding: 12, marginBottom: 12 }}>
+		                  <div style={{ display: "flex", gap: 8, background: "#121212", borderRadius: 999, padding: 5, marginBottom: 12 }}>
+		                    {[
+		                      { id: "join", label: "Join" },
+		                      { id: "create", label: "Create" },
+		                    ].map((item) => (
+		                      <button
+		                        key={item.id}
+		                        onClick={() => setCircleAddMode(item.id)}
+		                        style={{
+		                          flex: 1,
+		                          border: "none",
+		                          borderRadius: 999,
+		                          padding: "9px 10px",
+		                          background: circleAddMode === item.id ? "#19D12E" : "transparent",
+		                          color: circleAddMode === item.id ? "#050505" : "rgba(255,255,255,0.5)",
+		                          fontFamily: "'Sora', sans-serif",
+		                          fontSize: 12,
+		                          fontWeight: 900,
+		                          cursor: "pointer",
+		                        }}
+		                      >
+		                        {item.label}
+		                      </button>
+		                    ))}
+		                  </div>
+		                  {circleAddMode === "create" ? (
+		                    <div style={{ display: "flex", gap: 10 }}>
+		                      <input
+		                        className="field"
+		                        placeholder="Name your circle"
+		                        value={newCircleName}
+		                        onChange={e => setNewCircleName(e.target.value)}
+		                        style={{ flex: 1, padding: "12px 14px", borderRadius: 16, fontSize: 13 }}
+		                      />
+		                      <button className="ghost-btn" onClick={handleCreateCircle} style={{ width: "auto", padding: "10px 14px", color: "#FAFAFA" }}>
+		                        Create
+		                      </button>
+		                    </div>
+		                  ) : (
+		                    <div style={{ display: "flex", gap: 10 }}>
+		                      <input
+		                        className="field"
+		                        placeholder="Friend code"
+		                        value={joinCode}
+		                        onChange={e => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
+		                        style={{ flex: 1, padding: "12px 14px", borderRadius: 16, fontSize: 13 }}
+		                      />
+		                      <button className="ghost-btn" onClick={handleJoinCircle} style={{ width: "auto", padding: "10px 14px", color: "#FAFAFA" }}>
+		                        Join
+		                      </button>
+		                    </div>
+		                  )}
+		                </div>
+		              )}
 		              {circles.length > 0 && (
 		                <div style={{ display: "flex", gap: 8, overflowX: "auto", marginBottom: 10 }}>
 	                  {circles.map((circle) => (
@@ -1863,18 +2071,6 @@ export default function Wager() {
 		                  </div>
 		                </div>
 		              )}
-			              <div style={{ display: "flex", gap: 10 }}>
-			                <input
-			                  className="field"
-			                  placeholder="Join another code"
-			                  value={joinCode}
-		                  onChange={e => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
-		                  style={{ flex: 1, padding: "12px 14px", borderRadius: 16, fontSize: 13 }}
-		                />
-		                <button className="ghost-btn" onClick={handleJoinCircle} style={{ width: "auto", padding: "10px 14px", color: "#FAFAFA" }}>
-		                  Join
-		                </button>
-		              </div>
 		            </div>
 		          )}
 
@@ -1942,11 +2138,14 @@ export default function Wager() {
                   style={{ background: "#121212", borderRadius: 30, padding: 20, cursor: "pointer" }}
                 >
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}>
-                    <div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 8 }}>
                         {post.category} • @{post.creator}
                       </div>
-                      <div style={{ fontSize: 22, fontWeight: 800, lineHeight: 1.2 }}>{post.prompt}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <ProfileAvatar name={post.creator} color={post.creatorAvatarColor} src={post.creatorAvatarUrl} size={42} />
+                        <div style={{ fontSize: 22, fontWeight: 800, lineHeight: 1.2 }}>{post.prompt}</div>
+                      </div>
                     </div>
                     <div style={{ textAlign: "right", flexShrink: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 800, color: post.status === "settled" ? "#19D12E" : "rgba(255,255,255,0.5)", marginBottom: 8 }}>
@@ -1956,6 +2155,8 @@ export default function Wager() {
                       <div style={{ fontSize: 11, color: "rgba(255,255,255,0.38)" }}>total pot</div>
                     </div>
                   </div>
+
+                  <MarketImage src={post.imageUrl} />
 
                   <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
                       {[
@@ -2015,8 +2216,11 @@ export default function Wager() {
                           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                             {post.wagers.slice(0, 5).map((wager) => (
                               <div key={wager.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                                <div style={{ fontSize: 14, fontWeight: 700 }}>
-                                  {wager.bettorName} <span style={{ color: "rgba(255,255,255,0.4)" }}>on {wager.choice === "A" ? post.optionA : post.optionB}</span>
+                                <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0 }}>
+                                  <ProfileAvatar name={wager.bettorName} color={wager.bettorAvatarColor} src={wager.bettorAvatarUrl} size={28} />
+                                  <div style={{ fontSize: 14, fontWeight: 700 }}>
+                                    {wager.bettorName} <span style={{ color: "rgba(255,255,255,0.4)" }}>on {wager.choice === "A" ? post.optionA : post.optionB}</span>
+                                  </div>
                                 </div>
                                 <div style={{ fontSize: 14, fontWeight: 800, color: wager.isLocal ? "#19D12E" : "#FAFAFA" }}>
                                   {formatBetCoin(wager.amount)}
@@ -2078,9 +2282,18 @@ export default function Wager() {
 
             {visibleFeedPosts.length === 0 && (
               <div style={{ background: "#121212", borderRadius: 30, padding: 28, textAlign: "center", color: "rgba(255,255,255,0.34)" }}>
-                {feedView === "yours"
-                  ? "You have not posted any live feed bets yet. Hit the plus button and make one."
-                  : "Nothing on the feed yet. Hit the plus button and post a community bet."}
+                <div style={{ fontSize: 15, fontWeight: 700, lineHeight: 1.45, marginBottom: 16 }}>
+                  {feedView === "yours"
+                    ? "You have not posted any live feed bets yet."
+                    : "Nothing on the feed yet."}
+                </div>
+                <button
+                  className="big-btn"
+                  onClick={() => setFeedComposerOpen(true)}
+                  style={{ borderRadius: 22, background: "#19D12E", color: "#050505", boxShadow: "none" }}
+                >
+                  + Create Feed Bet
+                </button>
               </div>
             )}
           </div>
@@ -2206,6 +2419,37 @@ export default function Wager() {
                     Close
                   </button>
                 </div>
+                {backendEnabled && session && (
+                  <div style={{ background: "#171717", borderRadius: 18, padding: 14, marginBottom: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 }}>
+                      <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)" }}>POST IN</div>
+                      <button
+                        className={`chip ${postInAllCircles ? "picked" : ""}`}
+                        onClick={() => {
+                          setPostInAllCircles((current) => !current);
+                          setComposerCircleIds(circles.map((circle) => circle.id));
+                        }}
+                        style={{ margin: 0 }}
+                      >
+                        All Circles
+                      </button>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, overflowX: "auto" }}>
+                      {circles.map((circle) => {
+                        const selected = postInAllCircles || composerCircleIds.includes(circle.id);
+                        return (
+                          <button
+                            key={circle.id}
+                            className={`chip ${selected ? "picked" : ""}`}
+                            onClick={() => toggleComposerCircle(circle.id)}
+                          >
+                            {circle.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
                 <input
                   className="field"
                   placeholder="Creator name"
@@ -2221,6 +2465,27 @@ export default function Wager() {
                   onChange={e => setFeedDraft((current) => ({ ...current, prompt: e.target.value }))}
                   style={{ marginBottom: 12 }}
                 />
+                <div style={{ background: "#171717", borderRadius: 18, padding: 14, marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 6 }}>MARKET IMAGE</div>
+                      <div style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", lineHeight: 1.4 }}>
+                        Optional photo for the person, matchup, or moment.
+                      </div>
+                    </div>
+                    <label className="ghost-btn" style={{ width: "auto", padding: "10px 14px", color: "#FAFAFA", cursor: "pointer" }}>
+                      Choose
+                      <input type="file" accept="image/*" onChange={handleMarketImageChange} style={{ display: "none" }} />
+                    </label>
+                  </div>
+                  {marketImagePreview && (
+                    <img
+                      src={marketImagePreview}
+                      alt=""
+                      style={{ width: "100%", aspectRatio: "16 / 10", objectFit: "cover", borderRadius: 16, marginTop: 12 }}
+                    />
+                  )}
+                </div>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
                   {FEED_TEMPLATES.map((template) => (
                     <button
@@ -2262,8 +2527,8 @@ export default function Wager() {
                   onChange={e => setFeedDraft((current) => ({ ...current, endsAt: e.target.value }))}
                   style={{ marginBottom: 14 }}
                 />
-                <button className="big-btn" onClick={createFeedPost} style={{ borderRadius: 20 }}>
-                  POST
+                <button className="big-btn" onClick={createFeedPost} disabled={marketImageUploading} style={{ borderRadius: 20 }}>
+                  {marketImageUploading ? "UPLOADING..." : "POST"}
                 </button>
               </div>
             </div>

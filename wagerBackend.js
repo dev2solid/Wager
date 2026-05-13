@@ -4,6 +4,7 @@ const BETCOIN = "BetCoin";
 
 const genInviteName = () => `Circle ${new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
 const DEFAULT_AVATAR_COLOR = "#19D12E";
+const IMAGE_BUCKET = "wager-images";
 
 export const backendEnabled = isSupabaseConfigured;
 
@@ -60,6 +61,7 @@ export async function ensureProfile(user, username = null, avatarColor = null) {
   const { data, error } = await supabase.rpc("ensure_profile", {
     username_input: username || user.user_metadata?.username || user.email?.split("@")[0] || "You",
     avatar_color_input: avatarColor || user.user_metadata?.avatar_color || DEFAULT_AVATAR_COLOR,
+    avatar_url_input: user.user_metadata?.avatar_url || null,
   });
   if (error) throw error;
   return data?.[0] || null;
@@ -87,6 +89,36 @@ export async function updateProfile(userId, changes) {
     .single();
   if (error) throw error;
   return data;
+}
+
+function getFileExtension(file) {
+  const fromName = file?.name?.split(".").pop()?.toLowerCase();
+  if (fromName && /^[a-z0-9]+$/.test(fromName)) return fromName === "jpeg" ? "jpg" : fromName;
+  const fromType = file?.type?.split("/").pop()?.toLowerCase();
+  return fromType && /^[a-z0-9]+$/.test(fromType) ? fromType : "jpg";
+}
+
+async function uploadImage(file, userId, kind) {
+  if (!file || !userId) return null;
+  const extension = getFileExtension(file);
+  const id = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const path = `${userId}/${kind}-${id}.${extension}`;
+  const { error } = await supabase.storage.from(IMAGE_BUCKET).upload(path, file, {
+    cacheControl: "31536000",
+    contentType: file.type || "image/jpeg",
+    upsert: false,
+  });
+  if (error) throw error;
+  const { data } = supabase.storage.from(IMAGE_BUCKET).getPublicUrl(path);
+  return data.publicUrl;
+}
+
+export async function uploadProfileImage(file, userId) {
+  return uploadImage(file, userId, "profile");
+}
+
+export async function uploadMarketImage(file, userId) {
+  return uploadImage(file, userId, "market");
 }
 
 export async function listCircles() {
@@ -126,18 +158,19 @@ export async function listFeedPosts(circleId) {
       category,
       option_a,
       option_b,
+      image_url,
       ends_at,
       status,
       winning_choice,
       created_at,
-      profiles!feed_posts_creator_profile_fkey(username, avatar_color),
+      profiles!feed_posts_creator_profile_fkey(username, avatar_color, avatar_url),
       feed_wagers(
         id,
         user_id,
         choice,
         amount,
         created_at,
-        profiles!feed_wagers_user_profile_fkey(username, avatar_color)
+        profiles!feed_wagers_user_profile_fkey(username, avatar_color, avatar_url)
       )
     `)
     .eq("circle_id", circleId)
@@ -156,12 +189,36 @@ export async function createFeedPost(circleId, userId, draft) {
       category: draft.category.trim() || "Community Bet",
       option_a: draft.optionA.trim(),
       option_b: draft.optionB.trim(),
+      image_url: draft.imageUrl || null,
       ends_at: draft.endsAt || null,
     })
     .select()
     .single();
   if (error) throw error;
   return data;
+}
+
+export async function createFeedPostsForCircles(circleIds, userId, draft) {
+  const uniqueCircleIds = [...new Set((circleIds || []).filter(Boolean))];
+  if (uniqueCircleIds.length === 0) throw new Error("Choose at least one circle.");
+  const results = [];
+  const failures = [];
+
+  for (const circleId of uniqueCircleIds) {
+    try {
+      const post = await createFeedPost(circleId, userId, draft);
+      results.push({ circleId, post });
+    } catch (error) {
+      failures.push({ circleId, error });
+    }
+  }
+
+  if (failures.length > 0) {
+    const message = failures.map((failure) => failure.error?.message || "Unknown error").join("; ");
+    throw new Error(`Could not post to ${failures.length} circle${failures.length === 1 ? "" : "s"}: ${message}`);
+  }
+
+  return results;
 }
 
 export async function placeFeedWager(postId, userId, choice, amount) {
@@ -212,6 +269,8 @@ function mapFeedPost(row) {
     creatorId: row.creator_id,
     prompt: row.prompt,
     category: row.category,
+    imageUrl: row.image_url || null,
+    creatorAvatarUrl: row.profiles?.avatar_url || null,
     optionA: row.option_a,
     optionB: row.option_b,
     createdAt: new Date(row.created_at).toLocaleDateString("en-US", {
@@ -230,6 +289,7 @@ function mapFeedPost(row) {
       id: wager.id,
       bettorName: wager.profiles?.username || "Friend",
       bettorAvatarColor: wager.profiles?.avatar_color || DEFAULT_AVATAR_COLOR,
+      bettorAvatarUrl: wager.profiles?.avatar_url || null,
       userId: wager.user_id,
       choice: wager.choice,
       amount: wager.amount,
