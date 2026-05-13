@@ -57,15 +57,19 @@ export async function signOut() {
 }
 
 export async function ensureProfile(user, username = null, avatarColor = null) {
-  const profile = {
-    id: user.id,
-    username: username || user.user_metadata?.username || user.email?.split("@")[0] || "You",
-    avatar_color: avatarColor || user.user_metadata?.avatar_color || DEFAULT_AVATAR_COLOR,
-  };
+  const { data, error } = await supabase.rpc("ensure_profile", {
+    username_input: username || user.user_metadata?.username || user.email?.split("@")[0] || "You",
+    avatar_color_input: avatarColor || user.user_metadata?.avatar_color || DEFAULT_AVATAR_COLOR,
+  });
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+export async function getProfile(userId) {
   const { data, error } = await supabase
     .from("profiles")
-    .upsert(profile, { onConflict: "id" })
     .select()
+    .eq("id", userId)
     .single();
   if (error) throw error;
   return data;
@@ -94,20 +98,13 @@ export async function listCircles() {
   return data || [];
 }
 
-export async function createCircle(userId, name = genInviteName()) {
-  const { data: circle, error: circleError } = await supabase
-    .from("circles")
-    .insert({ name, created_by: userId })
-    .select("id, name, invite_code, created_at")
-    .single();
-  if (circleError) throw circleError;
-
-  const { error: memberError } = await supabase
-    .from("circle_members")
-    .insert({ circle_id: circle.id, user_id: userId, role: "owner" });
-  if (memberError) throw memberError;
-
-  return circle;
+export async function createCircle(_userId, name = genInviteName(), inviteCode = null) {
+  const { data, error } = await supabase.rpc("create_circle", {
+    circle_name_input: name,
+    invite_code_input: inviteCode,
+  });
+  if (error) throw error;
+  return data?.[0] || null;
 }
 
 export async function joinCircleByInviteCode(inviteCode) {
@@ -133,14 +130,14 @@ export async function listFeedPosts(circleId) {
       status,
       winning_choice,
       created_at,
-      profiles:creator_id(username, avatar_color),
+      profiles!feed_posts_creator_profile_fkey(username, avatar_color),
       feed_wagers(
         id,
         user_id,
         choice,
         amount,
         created_at,
-        profiles:user_id(username, avatar_color)
+        profiles!feed_wagers_user_profile_fkey(username, avatar_color)
       )
     `)
     .eq("circle_id", circleId)
@@ -168,35 +165,22 @@ export async function createFeedPost(circleId, userId, draft) {
 }
 
 export async function placeFeedWager(postId, userId, choice, amount) {
-  const { data, error } = await supabase
-    .from("feed_wagers")
-    .insert({ post_id: postId, user_id: userId, choice, amount })
-    .select()
-    .single();
+  const { data, error } = await supabase.rpc("place_feed_wager", {
+    post_id_input: postId,
+    choice_input: choice,
+    amount_input: amount,
+  });
   if (error) throw error;
-  return data;
+  return data?.[0] || null;
 }
 
 export async function settleFeedPostRemote(postId, winningChoice) {
-  const { data, error } = await supabase
-    .from("feed_posts")
-    .update({ status: "settled", winning_choice: winningChoice })
-    .eq("id", postId)
-    .select()
-    .single();
+  const { data, error } = await supabase.rpc("settle_feed_post", {
+    post_id_input: postId,
+    winning_choice_input: winningChoice,
+  });
   if (error) throw error;
-  return data;
-}
-
-export async function updateProfileWallet(userId, changes) {
-  const { data, error } = await supabase
-    .from("profiles")
-    .update(changes)
-    .eq("id", userId)
-    .select()
-    .single();
-  if (error) throw error;
-  return data;
+  return data?.[0] || null;
 }
 
 export function subscribeToCircleFeed(circleId, onChange) {

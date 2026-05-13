@@ -69,6 +69,93 @@ create table if not exists public.private_bets (
   created_at timestamptz not null default now()
 );
 
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'feed_posts_creator_profile_fkey'
+  ) then
+    alter table public.feed_posts
+    add constraint feed_posts_creator_profile_fkey
+    foreign key (creator_id) references public.profiles(id) on delete cascade
+    not valid;
+  end if;
+
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'feed_wagers_user_profile_fkey'
+  ) then
+    alter table public.feed_wagers
+    add constraint feed_wagers_user_profile_fkey
+    foreign key (user_id) references public.profiles(id) on delete cascade
+    not valid;
+  end if;
+end $$;
+
+create or replace function public.ensure_profile(username_input text default null, avatar_color_input text default null)
+returns table (
+  id uuid,
+  username text,
+  avatar_color text,
+  balance integer,
+  win_streak integer,
+  created_at timestamptz,
+  updated_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  profile_row public.profiles%rowtype;
+  display_name text;
+  safe_avatar_color text;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  display_name := coalesce(nullif(trim(username_input), ''), split_part(auth.jwt() ->> 'email', '@', 1), 'You');
+  safe_avatar_color := coalesce(nullif(trim(avatar_color_input), ''), '#19D12E');
+
+  insert into public.profiles (id, username, avatar_color)
+  values (auth.uid(), display_name, safe_avatar_color)
+  on conflict on constraint profiles_pkey do update
+  set
+    username = excluded.username,
+    avatar_color = excluded.avatar_color,
+    updated_at = now()
+  returning * into profile_row;
+
+  return query
+  select
+    profile_row.id,
+    profile_row.username,
+    profile_row.avatar_color,
+    profile_row.balance,
+    profile_row.win_streak,
+    profile_row.created_at,
+    profile_row.updated_at;
+end;
+$$;
+
+create or replace function public.is_circle_member(circle_id_input uuid)
+returns boolean
+language sql
+security definer
+set search_path = ''
+stable
+as $$
+  select exists (
+    select 1
+    from public.circle_members cm
+    where cm.circle_id = circle_id_input
+      and cm.user_id = auth.uid()
+  );
+$$;
+
 create or replace function public.join_circle_by_code(invite_code_input text)
 returns table (
   id uuid,
@@ -84,7 +171,11 @@ declare
   target_circle public.circles%rowtype;
   normalized_code text;
 begin
-  normalized_code := upper(trim(invite_code_input));
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  normalized_code := upper(regexp_replace(trim(invite_code_input), '[^A-Za-z0-9]', '', 'g'));
 
   select *
   into target_circle
@@ -103,6 +194,266 @@ begin
   select c.id, c.name, c.invite_code, c.created_at
   from public.circles c
   where c.id = target_circle.id;
+end;
+$$;
+
+create or replace function public.create_circle(circle_name_input text, invite_code_input text default null)
+returns table (
+  id uuid,
+  name text,
+  invite_code text,
+  created_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_circle public.circles%rowtype;
+  circle_name text;
+  normalized_code text;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  circle_name := coalesce(nullif(trim(circle_name_input), ''), 'Friends Feed');
+  normalized_code := nullif(upper(regexp_replace(coalesce(invite_code_input, ''), '[^A-Za-z0-9]', '', 'g')), '');
+
+  if normalized_code is null then
+    insert into public.circles (name, created_by)
+    values (circle_name, auth.uid())
+    returning * into target_circle;
+  else
+    insert into public.circles (name, invite_code, created_by)
+    values (circle_name, normalized_code, auth.uid())
+    returning * into target_circle;
+  end if;
+
+  insert into public.circle_members (circle_id, user_id, role)
+  values (target_circle.id, auth.uid(), 'owner')
+  on conflict (circle_id, user_id) do update set role = 'owner';
+
+  return query
+  select c.id, c.name, c.invite_code, c.created_at
+  from public.circles c
+  where c.id = target_circle.id;
+end;
+$$;
+
+create or replace function public.place_feed_wager(post_id_input uuid, choice_input text, amount_input integer)
+returns table (
+  id uuid,
+  post_id uuid,
+  user_id uuid,
+  choice text,
+  amount integer,
+  created_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_post public.feed_posts%rowtype;
+  created_wager public.feed_wagers%rowtype;
+  wallet_balance integer;
+  reserved_balance integer;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if choice_input not in ('A', 'B') then
+    raise exception 'Choose A or B';
+  end if;
+
+  if amount_input is null or amount_input <= 0 then
+    raise exception 'Enter a wager amount';
+  end if;
+
+  select *
+  into target_post
+  from public.feed_posts fp
+  where fp.id = post_id_input;
+
+  if target_post.id is null then
+    raise exception 'Feed post not found';
+  end if;
+
+  if target_post.status <> 'open' then
+    raise exception 'This market is already settled';
+  end if;
+
+  if not exists (
+    select 1
+    from public.circle_members cm
+    where cm.circle_id = target_post.circle_id
+      and cm.user_id = auth.uid()
+  ) then
+    raise exception 'You are not in this friend circle';
+  end if;
+
+  select p.balance
+  into wallet_balance
+  from public.profiles p
+  where p.id = auth.uid()
+  for update;
+
+  if wallet_balance is null then
+    raise exception 'Profile not found';
+  end if;
+
+  select coalesce(sum(fw.amount), 0)
+  into reserved_balance
+  from public.feed_wagers fw
+  join public.feed_posts fp on fp.id = fw.post_id
+  where fw.user_id = auth.uid()
+    and fp.status = 'open';
+
+  if amount_input > wallet_balance - reserved_balance then
+    raise exception 'Insufficient BetCoin';
+  end if;
+
+  insert into public.feed_wagers (post_id, user_id, choice, amount)
+  values (target_post.id, auth.uid(), choice_input, amount_input)
+  returning * into created_wager;
+
+  return query
+  select created_wager.id, created_wager.post_id, created_wager.user_id, created_wager.choice, created_wager.amount, created_wager.created_at;
+end;
+$$;
+
+create or replace function public.settle_feed_post(post_id_input uuid, winning_choice_input text)
+returns table (
+  id uuid,
+  circle_id uuid,
+  creator_id uuid,
+  prompt text,
+  category text,
+  option_a text,
+  option_b text,
+  ends_at timestamptz,
+  status text,
+  winning_choice text,
+  created_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_post public.feed_posts%rowtype;
+  settled_post public.feed_posts%rowtype;
+  winning_pool integer;
+  losing_pool integer;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if winning_choice_input not in ('A', 'B') then
+    raise exception 'Choose A or B';
+  end if;
+
+  select *
+  into target_post
+  from public.feed_posts fp
+  where fp.id = post_id_input
+  for update;
+
+  if target_post.id is null then
+    raise exception 'Feed post not found';
+  end if;
+
+  if target_post.creator_id <> auth.uid() then
+    raise exception 'Only the creator can settle this market';
+  end if;
+
+  if target_post.status <> 'open' then
+    raise exception 'This market is already settled';
+  end if;
+
+  select
+    coalesce(sum(amount) filter (where choice = winning_choice_input), 0),
+    coalesce(sum(amount) filter (where choice <> winning_choice_input), 0)
+  into winning_pool, losing_pool
+  from public.feed_wagers
+  where post_id = target_post.id;
+
+  if winning_pool > 0 and losing_pool > 0 then
+    update public.profiles p
+    set
+      balance = greatest(0, p.balance - losses.amount),
+      win_streak = 0,
+      updated_at = now()
+    from (
+      select user_id, sum(amount)::integer as amount
+      from public.feed_wagers
+      where post_id = target_post.id
+        and choice <> winning_choice_input
+      group by user_id
+    ) losses
+    where p.id = losses.user_id;
+
+    update public.profiles p
+    set
+      balance = p.balance + winners.share,
+      win_streak = p.win_streak + 1,
+      updated_at = now()
+    from (
+      with winner_amounts as (
+        select user_id, sum(amount)::integer as amount
+        from public.feed_wagers
+        where post_id = target_post.id
+          and choice = winning_choice_input
+        group by user_id
+      ),
+      base_shares as (
+        select
+          user_id,
+          amount,
+          floor((amount::numeric / winning_pool::numeric) * losing_pool::numeric)::integer as base_share
+        from winner_amounts
+      ),
+      remainder as (
+        select losing_pool - coalesce(sum(base_share), 0)::integer as extra
+        from base_shares
+      ),
+      ranked_winners as (
+        select
+          user_id,
+          base_share,
+          row_number() over (order by amount desc, user_id asc) as winner_rank
+        from base_shares
+      )
+      select
+        rw.user_id,
+        rw.base_share + case when rw.winner_rank <= r.extra then 1 else 0 end as share
+      from ranked_winners rw
+      cross join remainder r
+    ) winners
+    where p.id = winners.user_id;
+  end if;
+
+  update public.feed_posts fp
+  set status = 'settled', winning_choice = winning_choice_input
+  where fp.id = target_post.id
+  returning * into settled_post;
+
+  return query
+  select
+    settled_post.id,
+    settled_post.circle_id,
+    settled_post.creator_id,
+    settled_post.prompt,
+    settled_post.category,
+    settled_post.option_a,
+    settled_post.option_b,
+    settled_post.ends_at,
+    settled_post.status,
+    settled_post.winning_choice,
+    settled_post.created_at;
 end;
 $$;
 
@@ -143,13 +494,7 @@ on public.circles for select
 to authenticated
 using (
   created_by = (select auth.uid())
-  or
-  exists (
-    select 1
-    from public.circle_members cm
-    where cm.circle_id = id
-      and cm.user_id = (select auth.uid())
-  )
+  or public.is_circle_member(id)
 );
 
 drop policy if exists "circles_insert_creator" on public.circles;
@@ -164,12 +509,7 @@ on public.circle_members for select
 to authenticated
 using (
   user_id = (select auth.uid())
-  or exists (
-    select 1
-    from public.circle_members mine
-    where mine.circle_id = circle_members.circle_id
-      and mine.user_id = (select auth.uid())
-  )
+  or public.is_circle_member(circle_members.circle_id)
 );
 
 drop policy if exists "circle_members_insert_self" on public.circle_members;
@@ -183,12 +523,7 @@ create policy "feed_posts_select_circle_member"
 on public.feed_posts for select
 to authenticated
 using (
-  exists (
-    select 1
-    from public.circle_members cm
-    where cm.circle_id = feed_posts.circle_id
-      and cm.user_id = (select auth.uid())
-  )
+  public.is_circle_member(feed_posts.circle_id)
 );
 
 drop policy if exists "feed_posts_insert_circle_member" on public.feed_posts;
@@ -197,12 +532,7 @@ on public.feed_posts for insert
 to authenticated
 with check (
   creator_id = (select auth.uid())
-  and exists (
-    select 1
-    from public.circle_members cm
-    where cm.circle_id = feed_posts.circle_id
-      and cm.user_id = (select auth.uid())
-  )
+  and public.is_circle_member(feed_posts.circle_id)
 );
 
 drop policy if exists "feed_posts_update_creator" on public.feed_posts;
@@ -220,9 +550,8 @@ using (
   exists (
     select 1
     from public.feed_posts fp
-    join public.circle_members cm on cm.circle_id = fp.circle_id
     where fp.id = feed_wagers.post_id
-      and cm.user_id = (select auth.uid())
+      and public.is_circle_member(fp.circle_id)
   )
 );
 
@@ -235,10 +564,9 @@ with check (
   and exists (
     select 1
     from public.feed_posts fp
-    join public.circle_members cm on cm.circle_id = fp.circle_id
     where fp.id = feed_wagers.post_id
       and fp.status = 'open'
-      and cm.user_id = (select auth.uid())
+      and public.is_circle_member(fp.circle_id)
   )
 );
 
@@ -247,12 +575,7 @@ create policy "private_bets_select_circle_member"
 on public.private_bets for select
 to authenticated
 using (
-  exists (
-    select 1
-    from public.circle_members cm
-    where cm.circle_id = private_bets.circle_id
-      and cm.user_id = (select auth.uid())
-  )
+  public.is_circle_member(private_bets.circle_id)
 );
 
 drop policy if exists "private_bets_insert_circle_member" on public.private_bets;
@@ -261,12 +584,7 @@ on public.private_bets for insert
 to authenticated
 with check (
   creator_id = (select auth.uid())
-  and exists (
-    select 1
-    from public.circle_members cm
-    where cm.circle_id = private_bets.circle_id
-      and cm.user_id = (select auth.uid())
-  )
+  and public.is_circle_member(private_bets.circle_id)
 );
 
 drop policy if exists "private_bets_update_participant" on public.private_bets;
@@ -282,13 +600,32 @@ with check (
   or opponent_id = (select auth.uid())
 );
 
-grant select, insert, update on public.profiles to authenticated;
-grant select, insert on public.circles to authenticated;
-grant select, insert on public.circle_members to authenticated;
-grant select, insert, update on public.feed_posts to authenticated;
-grant select, insert on public.feed_wagers to authenticated;
-grant select, insert, update on public.private_bets to authenticated;
+revoke all on public.profiles from anon, authenticated;
+revoke all on public.circles from anon, authenticated;
+revoke all on public.circle_members from anon, authenticated;
+revoke all on public.feed_posts from anon, authenticated;
+revoke all on public.feed_wagers from anon, authenticated;
+revoke all on public.private_bets from anon, authenticated;
+
+grant select on public.profiles to authenticated;
+grant update (username, avatar_color, updated_at) on public.profiles to authenticated;
+grant select on public.circles to authenticated;
+grant select on public.circle_members to authenticated;
+grant select, insert on public.feed_posts to authenticated;
+grant select on public.feed_wagers to authenticated;
+grant select on public.private_bets to authenticated;
+revoke all on function public.join_circle_by_code(text) from public, anon;
+revoke all on function public.ensure_profile(text, text) from public, anon;
+revoke all on function public.is_circle_member(uuid) from public, anon;
+revoke all on function public.create_circle(text, text) from public, anon;
+revoke all on function public.place_feed_wager(uuid, text, integer) from public, anon;
+revoke all on function public.settle_feed_post(uuid, text) from public, anon;
 grant execute on function public.join_circle_by_code(text) to authenticated;
+grant execute on function public.ensure_profile(text, text) to authenticated;
+grant execute on function public.is_circle_member(uuid) to authenticated;
+grant execute on function public.create_circle(text, text) to authenticated;
+grant execute on function public.place_feed_wager(uuid, text, integer) to authenticated;
+grant execute on function public.settle_feed_post(uuid, text) to authenticated;
 
 do $$
 begin
@@ -312,3 +649,5 @@ begin
     end if;
   end if;
 end $$;
+
+notify pgrst, 'reload schema';

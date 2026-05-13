@@ -5,6 +5,7 @@ import {
   createFeedPost as createFeedPostRemote,
   ensureProfile,
   getCurrentSession,
+  getProfile,
   listCircles,
   listFeedPosts,
   joinCircleByInviteCode,
@@ -15,8 +16,6 @@ import {
   signOut,
   signUpAndJoinCircle,
   subscribeToCircleFeed,
-  updateProfile,
-  updateProfileWallet,
 } from "./wagerBackend.js";
 
 const load = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
@@ -324,6 +323,7 @@ export default function Wager() {
   const [authMode, setAuthMode] = useState("join");
   const [authForm, setAuthForm] = useState({ email: "", password: "", username: "", inviteCode: "" });
   const [joinCode, setJoinCode] = useState("");
+  const [newCircleName, setNewCircleName] = useState("");
   const [backendStatus, setBackendStatus] = useState("");
   const [authNotice, setAuthNotice] = useState("");
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
@@ -664,9 +664,12 @@ export default function Wager() {
     if (!backendEnabled || !session?.user) return;
     setBackendStatus("");
     try {
-      const circle = await createCircle(session.user.id, `${profileName}'s Circle`);
+      const name = newCircleName.trim() || `${profileName}'s Circle`;
+      const circle = await createCircle(session.user.id, name);
       setCircles((current) => [...current, circle]);
       setActiveCircleId(circle.id);
+      setNewCircleName("");
+      triggerCelebration("Circle created", `${circle.name} is ready for friends.`);
     } catch (error) {
       setBackendStatus(error.message || "Could not create a friend feed.");
     }
@@ -851,41 +854,42 @@ export default function Wager() {
       if (!wager.isLocal) return sum;
       return sum + (deltas[wager.id] || 0);
     }, 0);
-    if (localDelta !== 0) {
-      setBalance((current) => Math.max(0, current + localDelta));
-    }
     const localWagers = post.wagers.filter((wager) => wager.isLocal);
-    if (localWagers.length > 0) {
+
+    const showSettlementResult = (nextStreak = winStreak) => {
+      if (localWagers.length === 0) return;
       if (localDelta > 0) {
-        const nextStreak = winStreak + 1;
-        setWinStreak(nextStreak);
         triggerCelebration(`+${formatBetCoin(localDelta)}`, `Feed win. Streak x${nextStreak}.`, "win");
       } else if (localDelta < 0) {
-        setWinStreak(0);
         triggerCelebration(`${formatBetCoin(Math.abs(localDelta))} lost`, "Your side got faded on this market.", "loss");
       } else {
         triggerCelebration("Push market", "Nobody got paid because there was no opposite side to win from.");
       }
-    }
+    };
+
     if (backendEnabled) {
       try {
         await settleFeedPostRemote(postId, winningChoice);
-        if (session?.user && localDelta !== 0) {
-          const nextBalance = Math.max(0, balance + localDelta);
-          const nextWinStreak = localDelta > 0 ? winStreak + 1 : localDelta < 0 ? 0 : winStreak;
-          const nextProfile = await updateProfileWallet(session.user.id, {
-            balance: nextBalance,
-            win_streak: nextWinStreak,
-          });
+        if (session?.user) {
+          const nextProfile = await getProfile(session.user.id);
           setProfile(nextProfile);
-          setBalance(nextProfile.balance ?? nextBalance);
-          setWinStreak(nextProfile.win_streak ?? nextWinStreak);
+          setBalance(nextProfile.balance ?? balance);
+          setWinStreak(nextProfile.win_streak ?? winStreak);
+          showSettlementResult(nextProfile.win_streak ?? winStreak);
+        } else {
+          showSettlementResult();
         }
       } catch (error) {
         setBackendStatus(error.message || "Could not settle this bet.");
       }
       return;
     }
+    if (localDelta !== 0) {
+      setBalance((current) => Math.max(0, current + localDelta));
+    }
+    const nextLocalStreak = localDelta > 0 ? winStreak + 1 : localDelta < 0 ? 0 : winStreak;
+    setWinStreak(nextLocalStreak);
+    showSettlementResult(nextLocalStreak);
     setFeedPosts((current) => current.map((item) => item.id === postId ? { ...item, status: "settled", winningChoice } : item));
   };
 
@@ -1817,8 +1821,17 @@ export default function Wager() {
 		                  <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 6 }}>FRIEND CIRCLE</div>
 			                  <div style={{ fontSize: 18, fontWeight: 800 }}>{activeCircle?.name || (circles.length ? "Choose a circle" : "Enter a friend code or create your own circle.")}</div>
 		                </div>
+		              </div>
+		              <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+		                <input
+		                  className="field"
+		                  placeholder="Name your circle"
+		                  value={newCircleName}
+		                  onChange={e => setNewCircleName(e.target.value)}
+		                  style={{ flex: 1, padding: "12px 14px", borderRadius: 16, fontSize: 13 }}
+		                />
 		                <button className="ghost-btn" onClick={handleCreateCircle} style={{ width: "auto", padding: "10px 14px", color: "#FAFAFA" }}>
-		                  New Circle
+		                  Create
 		                </button>
 		              </div>
 		              {circles.length > 0 && (
@@ -1838,6 +1851,9 @@ export default function Wager() {
 		                <div style={{ background: "#1B1B1B", borderRadius: 20, padding: 14, marginBottom: 12 }}>
 		                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
 		                    <div>
+			                      <div style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "rgba(25,209,46,0.12)", color: "#86EFAC", border: "1px solid rgba(25,209,46,0.18)", borderRadius: 999, padding: "6px 9px", fontSize: 11, fontWeight: 900, marginBottom: 10 }}>
+			                        YOU'RE IN THIS CIRCLE
+			                      </div>
 			                      <div style={{ fontSize: 11, fontWeight: 900, letterSpacing: "0.12em", color: "rgba(255,255,255,0.34)", marginBottom: 8 }}>FRIEND CODE</div>
 		                      <div style={{ fontSize: 26, fontWeight: 900, letterSpacing: "0.08em", color: "#19D12E" }}>{activeCircle.invite_code}</div>
 		                    </div>
